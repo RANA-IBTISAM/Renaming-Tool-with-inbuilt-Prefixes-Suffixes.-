@@ -1,0 +1,282 @@
+# -*- coding: utf-8 -*-
+# RenameSettlementData.pyt
+# ArcGIS 10.8 Python Toolbox
+
+import arcpy
+import os
+import shutil
+import gc
+import time
+import re
+
+class Toolbox(object):
+    def __init__(self):
+        self.label = "Rename Settlement Data"
+        self.alias = "renamesettlement"
+        self.tools = [RenameSettlementData]
+
+class RenameSettlementData(object):
+    def __init__(self):
+        self.label = "Rename Settlement Data"
+        self.description = "Rename main folder, subfolder data, GDB, feature class, rasters (with sidecars), ECW, and AOI files"
+        self.canRunInBackground = False
+
+    def getParameterInfo(self):
+        params = []
+
+        p0 = arcpy.Parameter(
+            displayName="Working Root Folder",
+            name="working_root",
+            datatype="DEFolder",
+            parameterType="Required",
+            direction="Input")
+
+        p1 = arcpy.Parameter(
+            displayName="Code",
+            name="code",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
+
+        p2 = arcpy.Parameter(
+            displayName="Settlement Name",
+            name="settlement_name",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input")
+
+        p3 = arcpy.Parameter(
+            displayName="Mode",
+            name="mode",
+            datatype="GPString",
+            parameterType="Optional",
+            direction="Input")
+        p3.filter.type = "ValueList"
+        p3.filter.list = ["Preview", "Execute"]
+        p3.value = "Preview"
+
+        return [p0, p1, p2, p3]
+
+    def isLicensed(self):
+        return True
+
+    def execute(self, parameters, messages):
+        working_root = parameters[0].valueAsText
+        code = parameters[1].valueAsText
+        name = parameters[2].valueAsText
+        mode = parameters[3].valueAsText
+
+        if not os.path.exists(working_root):
+            arcpy.AddError("Working root does not exist: {}".format(working_root))
+            return
+
+        # Rename main folder
+        base_dir = os.path.dirname(working_root)
+        new_folder_name = "{}".format(name)
+        new_folder_path = os.path.join(base_dir, new_folder_name)
+
+        if mode == "Preview":
+            arcpy.AddMessage("[PREVIEW] Folder {} -> {}".format(working_root, new_folder_path))
+        else:
+            try:
+                if working_root != new_folder_path:
+                    os.rename(working_root, new_folder_path)
+                    arcpy.AddMessage("Folder renamed: {} -> {}".format(working_root, new_folder_path))
+                    working_root = new_folder_path
+            except Exception as e:
+                arcpy.AddWarning("Error renaming main folder: {}".format(e))
+
+        # Define subfolders
+        subfolders = {
+            'ortho': 'Aerial Orthoimage',
+            'dsm': 'Digital Surface Model (DSM)',
+            'parcels': 'Digitized Parcels',
+            'ecw': 'Ecw',
+            'gcp': 'Ground Control Points',
+            'aoi': 'Survey Boundary'  # we will handle AOI logic separately
+        }
+
+        for key, sub in subfolders.items():
+            folder_path = os.path.join(working_root, sub)
+            if not os.path.exists(folder_path) and key != 'aoi':  # skip AOI here, handle below
+                arcpy.AddWarning("Subfolder not found: {}".format(folder_path))
+                continue
+
+            # --- ORTHO ---
+            if key == 'ortho':
+                for f in os.listdir(folder_path):
+                    if f.lower().endswith(('.tif', '.img', '.jp2')):
+                        old_base, ext = os.path.splitext(f)
+                        new_base = "{}_{}_ORTHO".format(code, name)
+                        new_name = new_base + ext
+                        self._rename_file(os.path.join(folder_path, f),
+                                          os.path.join(folder_path, new_name),
+                                          mode)
+
+                        # rename sidecars
+                        for side_ext in [".aux.xml", ".ovr", ".rrd", ".xml", ".prj", ".tfw"]:
+                            old_side = os.path.join(folder_path, old_base + side_ext)
+                            if os.path.exists(old_side):
+                                new_side = os.path.join(folder_path, new_base + side_ext)
+                                self._rename_file(old_side, new_side, mode)
+
+            # --- DSM ---
+            elif key == 'dsm':
+                for f in os.listdir(folder_path):
+                    if f.lower().endswith(('.tif', '.img')):
+                        old_base, ext = os.path.splitext(f)
+                        new_base = "{}_{}_DSM".format(code, name)
+                        new_name = new_base + ext
+                        self._rename_file(os.path.join(folder_path, f),
+                                          os.path.join(folder_path, new_name),
+                                          mode)
+
+                        for side_ext in [".aux.xml", ".ovr", ".rrd", ".xml", ".prj", ".tfw"]:
+                            old_side = os.path.join(folder_path, old_base + side_ext)
+                            if os.path.exists(old_side):
+                                new_side = os.path.join(folder_path, new_base + side_ext)
+                                self._rename_file(old_side, new_side, mode)
+
+            # --- Parcels / GDB ---
+            elif key == 'parcels':
+                for f in os.listdir(folder_path):
+                    if f.lower().endswith(".gdb"):
+                        old_gdb = os.path.join(folder_path, f)
+                        new_gdb = os.path.join(folder_path, "{}_{}.gdb".format(code, name))
+                        if mode == "Preview":
+                            arcpy.AddMessage("[PREVIEW] GDB {} -> {}".format(old_gdb, new_gdb))
+                        else:
+                            if old_gdb != new_gdb:
+                                os.rename(old_gdb, new_gdb)
+                                arcpy.AddMessage("GDB renamed: {} -> {}".format(old_gdb, new_gdb))
+
+                        # Feature class renaming (remove prefix, numbers, spaces; keep underscores)
+                        try:
+                            gdb_name = os.path.basename(new_gdb).replace(".gdb", "")
+
+                            # Drop prefix before first underscore if exists
+                            if "_" in gdb_name:
+                                gdb_name = gdb_name.split("_", 1)[1]
+
+                            # Remove numbers and spaces, keep underscores
+                            new_fc_name = re.sub(r"[0-9\s]", "", gdb_name)
+
+                            # Remove leading underscore if any
+                            if new_fc_name.startswith("_"):
+                                new_fc_name = new_fc_name[1:]
+
+                            arcpy.env.workspace = new_gdb
+                            fcs = arcpy.ListFeatureClasses()
+
+                            if fcs:
+                                old_fc = fcs[0]
+                                if mode == "Preview":
+                                    arcpy.AddMessage("[PREVIEW] FeatureClass {} -> {}".format(old_fc, new_fc_name))
+                                else:
+                                    try:
+                                        arcpy.ClearWorkspaceCache_management()
+                                        arcpy.Rename_management(os.path.join(new_gdb, old_fc), new_fc_name)
+                                        arcpy.AddMessage("FeatureClass renamed: {} -> {}".format(old_fc, new_fc_name))
+                                    except Exception as e:
+                                        arcpy.AddWarning("Failed to rename feature class {} : {}".format(old_fc, e))
+                        except Exception as e:
+                            arcpy.AddWarning("Error handling GDB {} : {}".format(new_gdb, e))
+
+            # --- ECW (updated sidecar renaming) ---
+            elif key == 'ecw':
+                for f in os.listdir(folder_path):
+                    if f.lower().endswith(".ecw"):
+                        old_base, ext = os.path.splitext(f)
+                        new_base = "{}_{}_ECW".format(code, name)
+                        new_name = new_base + ext
+                        self._rename_file(os.path.join(folder_path, f),
+                                          os.path.join(folder_path, new_name),
+                                          mode)
+
+                        # rename ECW sidecars with same convention
+                        for side_ext in [".aux.xml", ".ovr", ".rrd", ".prj", ".tfw", ".xml",".ecw.xml"]:
+                            old_side = os.path.join(folder_path, old_base + side_ext)
+                            if os.path.exists(old_side):
+                                new_side = os.path.join(folder_path, new_base + side_ext)
+                                self._rename_file(old_side, new_side, mode)
+
+            # --- GCP (skip, empty) ---
+            elif key == 'gcp':
+                pass
+
+            # --- AOI ---
+            elif key == 'aoi':
+                survey_boundary_path = os.path.join(working_root, "Survey Boundary")
+                aoi_path = os.path.join(working_root, "Aoi")
+
+                target_folder = None
+
+                # Case 1: Survey Boundary exists → rename to Aoi
+                if os.path.exists(survey_boundary_path):
+                    if mode == "Preview":
+                        arcpy.AddMessage("[PREVIEW] Folder {} -> {}".format(survey_boundary_path, aoi_path))
+                        target_folder = survey_boundary_path
+                    else:
+                        try:
+                            if os.path.exists(aoi_path):
+                                target_folder = aoi_path
+                            else:
+                                os.rename(survey_boundary_path, aoi_path)
+                                arcpy.AddMessage("Folder renamed: {} -> {}".format(survey_boundary_path, aoi_path))
+                                target_folder = aoi_path
+                        except Exception as e:
+                            arcpy.AddWarning("Error renaming Survey Boundary folder {} : {}".format(survey_boundary_path, e))
+                            target_folder = survey_boundary_path
+
+                # Case 2: AOI folder already exists
+                elif os.path.exists(aoi_path):
+                    target_folder = aoi_path
+                    if mode == "Preview":
+                        arcpy.AddMessage("[PREVIEW] AOI folder already exists, will only rename files inside.")
+
+                else:
+                    arcpy.AddWarning("AOI/Survey Boundary subfolder not found in {}".format(working_root))
+                    continue
+
+                # Rename shapefile + sidecars (overwrite if exists)
+                base_new = "{}_{}_Aoi".format(code, name)
+                shapefile = None
+                for f in os.listdir(target_folder):
+                    if f.lower().endswith(".shp"):
+                        shapefile = os.path.splitext(f)[0]
+                        break
+
+                if shapefile:
+                    extensions = [".shp", ".shx", ".dbf", ".prj", ".cpg", ".sbn", ".sbx", ".shp.xml", ".xml"]
+                    for ext in extensions:
+                        old_path = os.path.join(target_folder, shapefile + ext)
+                        if os.path.exists(old_path):
+                            new_path = os.path.join(target_folder, base_new + ext)
+
+                            # Overwrite if target already exists (only in Execute mode)
+                            if os.path.exists(new_path) and mode != "Preview":
+                                try:
+                                    os.remove(new_path)
+                                    arcpy.AddWarning("Overwritten: {}".format(new_path))
+                                except Exception as e:
+                                    arcpy.AddWarning("Failed to overwrite {} : {}".format(new_path, e))
+
+                            self._rename_file(old_path, new_path, mode)
+                else:
+                    arcpy.AddWarning("No shapefile found inside {}".format(target_folder))
+
+        gc.collect()
+        time.sleep(0.2)
+
+    def _rename_file(self, old_path, new_path, mode):
+        if mode == "Preview":
+            arcpy.AddMessage("[PREVIEW] {} -> {}".format(old_path, new_path))
+        else:
+            try:
+                if os.path.exists(new_path):
+                    arcpy.AddWarning("Target exists, skipping: {}".format(new_path))
+                else:
+                    os.rename(old_path, new_path)
+                    arcpy.AddMessage("Renamed: {} -> {}".format(old_path, new_path))
+            except Exception as e:
+                arcpy.AddWarning("Error renaming {} : {}".format(old_path, e))
